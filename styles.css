@@ -1,0 +1,65 @@
+/* styles.css */
+
+#linkedin-exact-metrics-widget {
+  display: none; /* Hidden by default, shown by content script */
+  position: fixed;
+  top: 100px;
+  right: 20px;
+  z-index: 9999;
+  background-color: #ffffff;
+  border: 1px solid #e0e0e0;
+  border-radius: 8px;
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.15);
+  font-family: -apple-system, system-ui, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', 'Fira Sans', Ubuntu, Oxygen, 'Oxygen Sans', Cantarell, 'Droid Sans', 'Apple Color Emoji', 'Segoe UI Emoji', 'Segoe UI Symbol', 'Lucida Grande', Helvetica, Arial, sans-serif;
+  width: 220px;
+  color: #333;
+  font-size: 14px;
+  transition: all 0.3s ease-in-out;
+}
+
+#linkedin-exact-metrics-widget:hover {
+    transform: scale(1.02);
+    box-shadow: 0 6px 16px rgba(0, 0, 0, 0.2);
+}
+
+.widget-header {
+  background-color: #f0f2f5;
+  padding: 8px 12px;
+  font-weight: 600;
+  border-bottom: 1px solid #e0e0e0;
+  border-top-left-radius: 8px;
+  border-top-right-radius: 8px;
+}
+
+.widget-body {
+  padding: 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.widget-body div {
+  display: flex;
+  justify-content: space-between;
+}
+
+.widget-body span {
+  font-weight: 700;
+  color: #0a66c2; /* LinkedIn Blue */
+}
+
+.widget-footer {
+  font-size: 10px;
+  color: #888;
+  text-align: center;
+  padding: 6px;
+  background-color: #f0f2f5;
+  border-top: 1px solid #e0e0e0;
+  border-bottom-left-radius: 8px;
+  border-bottom-right-radius: 8px;
+}
+
+#exact-age span {
+    color: #5e5e5e; /* A more neutral color for secondary info */
+    font-weight: 600;
+}
