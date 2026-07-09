@@ -71,6 +71,11 @@
     }
 
     visibilityCheckInterval = setInterval(() => {
+      // Skip the DOM query while the tab isn't visible -- saves CPU for
+      // users who routinely leave LinkedIn tabs open in the background.
+      if (document.hidden) {
+        return;
+      }
       const jobDetailsVisible = document.querySelector('.jobs-details__main-content');
       if (!jobDetailsVisible) {
         hideWidget();
@@ -123,7 +128,6 @@
     } else if (request.type === "UPDATE_METRICS") {
       // Ensure data exists before trying to destructure it.
       if (request.data) {
-        console.log("Content script received metrics:", request.data);
         const { viewCount, applicantCount, jobAge } = request.data;
         updateWidget(viewCount, applicantCount, jobAge);
       }
@@ -134,5 +138,18 @@
   // Listen for messages from the background script
   chrome.runtime.onMessage.removeListener(messageListener); // Remove old listener to be safe
   chrome.runtime.onMessage.addListener(messageListener);
+
+  // If the user flips the "show widget" toggle off in the popup while a
+  // widget is already showing, hide it immediately rather than waiting for
+  // the next navigation.
+  chrome.storage.onChanged.addListener((changes, areaName) => {
+    if (areaName === 'sync' && changes.widgetEnabled && changes.widgetEnabled.newValue === false) {
+      if (visibilityCheckInterval) {
+        clearInterval(visibilityCheckInterval);
+        visibilityCheckInterval = null;
+      }
+      hideWidget();
+    }
+  });
 
 })();

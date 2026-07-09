@@ -1,225 +1,292 @@
 // background.js
 
-// A temporary in-memory store for request headers, keyed by requestId.
-const requestHeadersStore = {};
-// A cache for the last known good set of headers for proactive fetching.
-let lastKnownHeaders = {};
+importScripts('lib/jobData.js');
+const { extractJobIdFromApiUrl, extractJobIdFromPageUrl, parseJobPostingResponse } = self.JobDataLib;
 
-const LINKEDIN_JOBS_BASE_URL = "linkedin.com/jobs/";
-const LINKEDIN_JOB_VIEW_URL = "linkedin.com/jobs/view/";
+// --- Settings (read from storage so the popup can change them at runtime) ---
+
+let debugMode = false;
+let widgetEnabled = true;
+
+chrome.storage.local.get(['debugMode'], (result) => {
+  debugMode = Boolean(result.debugMode);
+});
+chrome.storage.sync.get(['widgetEnabled'], (result) => {
+  widgetEnabled = result.widgetEnabled !== false; // default true
+});
+chrome.storage.onChanged.addListener((changes, areaName) => {
+  if (areaName === 'local' && changes.debugMode) {
+    debugMode = Boolean(changes.debugMode.newValue);
+  }
+  if (areaName === 'sync' && changes.widgetEnabled) {
+    widgetEnabled = changes.widgetEnabled.newValue !== false;
+  }
+});
+
+function log(...args) {
+  if (debugMode) console.log(...args);
+}
+
+// --- In-memory, per-request header capture (short-lived; a single request's
+// onBeforeSendHeaders and onCompleted always fire within the same event, so
+// this doesn't need to survive a service worker restart). ---
+const requestHeadersStore = {};
+
+// Cap so a long browsing session can't grow this unboundedly if a request
+// never completes (tab closed mid-flight, etc).
+const MAX_PENDING_REQUESTS = 50;
+function capPendingRequests() {
+  const keys = Object.keys(requestHeadersStore);
+  if (keys.length > MAX_PENDING_REQUESTS) {
+    delete requestHeadersStore[keys[0]];
+  }
+}
+
+// Jobs currently being fetched, so the passive (webRequest-triggered) path and
+// the proactive (cache-miss-triggered) path can't both fire a fetch for the
+// same job at the same time.
+const pendingJobFetches = new Set();
+
+const LINKEDIN_JOBS_BASE_URL = 'linkedin.com/jobs/';
+
+// --- Persistent "last known good headers" cache -----------------------------
+// MV3 service workers are torn down after ~30s of inactivity. A plain module
+// variable resets to {} on every restart, which used to make proactive
+// fetches fail intermittently right after the browser reclaimed the worker --
+// exactly when a user re-opens a job tab after a break. chrome.storage.session
+// survives worker restarts (it's only cleared when the browser session ends),
+// so it's used here instead.
+const HEADERS_STORAGE_KEY = 'lastKnownHeaders';
+
+async function getLastKnownHeaders() {
+  const result = await chrome.storage.session.get(HEADERS_STORAGE_KEY);
+  return result[HEADERS_STORAGE_KEY] || {};
+}
+
+async function setLastKnownHeaders(headers) {
+  await chrome.storage.session.set({ [HEADERS_STORAGE_KEY]: headers });
+}
+
+// --- Job data cache, capped so a long session doesn't grow storage forever --
+const CACHE_ORDER_KEY = '__jobCacheOrder';
+const MAX_CACHED_JOBS = 200;
+
+async function cacheJobData(jobId, data) {
+  await chrome.storage.session.set({ [jobId]: data });
+
+  const orderResult = await chrome.storage.session.get(CACHE_ORDER_KEY);
+  const order = (orderResult[CACHE_ORDER_KEY] || []).filter((id) => id !== jobId);
+  order.push(jobId);
+
+  const toEvict = order.length > MAX_CACHED_JOBS ? order.splice(0, order.length - MAX_CACHED_JOBS) : [];
+  if (toEvict.length > 0) {
+    await chrome.storage.session.remove(toEvict);
+  }
+  await chrome.storage.session.set({ [CACHE_ORDER_KEY]: order });
+}
+
+async function getCachedJobData(jobId) {
+  const result = await chrome.storage.session.get(jobId);
+  return result[jobId] || null;
+}
 
 /**
  * Injects the content script and CSS into the specified tab.
- * This function is designed to be idempotent and handles errors gracefully.
- * @param {number} tabId The ID of the tab to inject scripts into.
+ * Idempotent (content.js guards against double-init) and safe to call
+ * repeatedly. Returns a Promise so callers can actually await completion --
+ * the previous version returned undefined, so its `await` calls were no-ops
+ * and callers proceeded before injection had actually finished.
  */
-function injectScripts(tabId) {
-  console.log(`Attempting to inject scripts into tab ${tabId}`);
-  chrome.scripting.insertCSS({
-    target: { tabId: tabId },
-    files: ["styles.css"],
-  }).catch(err => console.error("Failed to inject CSS:", err));
-
-  chrome.scripting.executeScript({
-    target: { tabId: tabId },
-    files: ["content.js"],
-  }).catch(err => console.error("Failed to inject JS:", err));
+async function injectScripts(tabId) {
+  log(`Attempting to inject scripts into tab ${tabId}`);
+  await Promise.all([
+    chrome.scripting.insertCSS({ target: { tabId }, files: ['styles.css'] }).catch((err) => {
+      console.error('Failed to inject CSS:', err);
+    }),
+    chrome.scripting.executeScript({ target: { tabId }, files: ['content.js'] }).catch((err) => {
+      console.error('Failed to inject JS:', err);
+    }),
+  ]);
 }
 
-// 1. Inject script on initial page load to a jobs URL.
-// This runs only once per full page load and ensures the content script is ready.
-chrome.webNavigation.onCommitted.addListener((details) => {
-  // We only care about the main frame, not iframes.
-  if (details.frameId === 0 && details.url.includes(LINKEDIN_JOBS_BASE_URL)) {
-    console.log(`[DEBUG] onCommitted: Initial load to jobs page. Injecting scripts.`);
-    injectScripts(details.tabId);
-  }
-}, { url: [{ hostContains: 'linkedin.com' }] });
+function sendMessageSafe(tabId, message) {
+  return chrome.tabs.sendMessage(tabId, message).catch(() => {
+    // Tab navigated away or closed before the message could be delivered.
+  });
+}
+
+// 1. Inject script on initial page load to a jobs URL. This also acts as a
+// safety net alongside the declarative content_scripts entry in manifest.json
+// for the (rare) case where the service worker was still waking up when
+// onCommitted fired for the very first navigation.
+chrome.webNavigation.onCommitted.addListener(
+  (details) => {
+    if (!widgetEnabled) return;
+    if (details.frameId === 0 && details.url.includes(LINKEDIN_JOBS_BASE_URL)) {
+      log('[DEBUG] onCommitted: Initial load to jobs page. Injecting scripts.');
+      injectScripts(details.tabId);
+    }
+  },
+  { url: [{ hostContains: 'linkedin.com' }] }
+);
 
 // 2. Handle SPA (Single-Page Application) navigations.
 chrome.webNavigation.onHistoryStateUpdated.addListener(async (details) => {
-  // We only care about URL changes on the main page.
-  if (details.frameId === 0 && details.url.includes(LINKEDIN_JOBS_BASE_URL)) {
-    const isJobViewPage = details.url.includes(LINKEDIN_JOB_VIEW_URL) || details.url.includes("currentJobId=");
+  if (!widgetEnabled) return;
+  if (details.frameId !== 0 || !details.url.includes(LINKEDIN_JOBS_BASE_URL)) return;
 
-    if (isJobViewPage) {
-      console.log(`[DEBUG] History Update: Job view page detected.`);
+  const jobId = extractJobIdFromPageUrl(details.url);
+  const isJobViewPage = details.url.includes('linkedin.com/jobs/view/') || details.url.includes('currentJobId=');
+  if (!isJobViewPage || !jobId) return;
 
-      // Immediately reset the widget to "Loading..." for a responsive feel.
-      chrome.tabs.sendMessage(details.tabId, { type: "RESET_WIDGET" }).catch(e => {});
+  log('[DEBUG] History Update: Job view page detected.', jobId);
 
-      // Extract job ID from URL to check our cache.
-      const url = new URL(details.url);
-      const jobId = url.searchParams.get("currentJobId") || details.url.split('/view/')[1]?.split('/')[0];
+  // Immediately reset the widget to "Loading..." for a responsive feel.
+  sendMessageSafe(details.tabId, { type: 'RESET_WIDGET' });
 
-      if (jobId) {
-        // Check if we have data for this job in our session cache.
-        const cachedData = await chrome.storage.session.get(jobId);
-        if (cachedData && cachedData[jobId]) {
-          console.log(`[DEBUG] Found cached data for job ${jobId}. Sending to content script.`);
-          // If we have cached data, send it immediately to prevent getting stuck on "Loading..."
-          await chrome.tabs.sendMessage(details.tabId, {
-            type: "UPDATE_METRICS",
-            data: cachedData[jobId]
-          });
-        } else {
-          // If data is not in cache, proactively trigger a fetch.
-          // This solves the "stuck on loading" issue when LinkedIn uses its own cache.
-          console.log(`[DEBUG] No cache for job ${jobId}. Proactively fetching.`);
-          // We need to construct the API URL to fetch the data.
-          const apiUrl = `https://www.linkedin.com/voyager/api/jobs/jobPostings/${jobId}?decorationId=com.linkedin.voyager.deco.jobs.web.shared.WebFullJobPosting-65`;
-          fetchAndRelayJobData({ url: apiUrl, tabId: details.tabId, requestId: `manual-${jobId}-${Date.now()}` });
-        }
-      }
-    }
+  const cachedData = await getCachedJobData(jobId);
+  if (cachedData) {
+    log(`[DEBUG] Found cached data for job ${jobId}. Sending to content script.`);
+    await sendMessageSafe(details.tabId, { type: 'UPDATE_METRICS', data: cachedData });
+    return;
   }
+
+  if (pendingJobFetches.has(jobId)) {
+    log(`[DEBUG] Job ${jobId} is already being fetched (passively). Skipping duplicate proactive fetch.`);
+    return;
+  }
+
+  log(`[DEBUG] No cache for job ${jobId}. Proactively fetching.`);
+  const apiUrl = `https://www.linkedin.com/voyager/api/jobs/jobPostings/${jobId}?decorationId=com.linkedin.voyager.deco.jobs.web.shared.WebFullJobPosting-65`;
+  fetchAndRelayJobData({ url: apiUrl, tabId: details.tabId, requestId: `manual-${jobId}-${Date.now()}` }, jobId);
 });
 
 // Listen for the request headers of the API call to capture the csrf-token.
 chrome.webRequest.onBeforeSendHeaders.addListener(
-  (details) => {    
-    console.log(`[DEBUG] onBeforeSendHeaders fired for URL: ${details.url}`);
+  (details) => {
     // If the request is from our own extension, ignore it to prevent loops.
-    if (details.requestHeaders.some(h => h.name.toLowerCase() === 'x-exact-metrics-request')) {
-      console.log("[DEBUG] Ignoring request from our own extension.");
+    if (details.requestHeaders.some((h) => h.name.toLowerCase() === 'x-exact-metrics-request')) {
       return {};
     }
 
     const { tabId, requestHeaders } = details;
     if (tabId > 0) {
-      // Whitelist of headers to capture from the original request.
-      const headersToCapture = [
-        'csrf-token',
-        'x-li-lang',
-        'x-li-page-instance',
-        'x-li-track',
-        'x-restli-protocol-version'
-      ];
+      const headersToCapture = ['csrf-token', 'x-li-lang', 'x-li-page-instance', 'x-li-track', 'x-restli-protocol-version'];
 
       const capturedHeaders = {};
       for (const header of requestHeaders) {
-        const lowerCaseHeaderName = header.name.toLowerCase();
-        if (headersToCapture.includes(lowerCaseHeaderName)) {
+        if (headersToCapture.includes(header.name.toLowerCase())) {
           capturedHeaders[header.name] = header.value;
         }
       }
-      console.log(`[DEBUG] Captured headers for tab ${tabId}:`, capturedHeaders);
-      // Store the captured headers using the unique requestId.
       requestHeadersStore[details.requestId] = capturedHeaders;
-      // Also update our last known good headers cache for proactive fetches.
-      lastKnownHeaders = capturedHeaders;
+      capPendingRequests();
+      setLastKnownHeaders(capturedHeaders);
     }
   },
-  { urls: ["*://*.linkedin.com/voyager/api/jobs/jobPostings/*"] },
-  ["requestHeaders"]
+  { urls: ['*://*.linkedin.com/voyager/api/jobs/jobPostings/*'] },
+  ['requestHeaders']
 );
 
 chrome.webRequest.onCompleted.addListener(
   (details) => {
-    console.log(`[DEBUG] onCompleted fired for URL: ${details.url}`);
     // Check the initiator to ensure we're not catching our own fetch requests.
     if (details.initiator && details.initiator.startsWith('chrome-extension://')) {
       return;
     }
+    if (!widgetEnabled) return;
 
-    fetchAndRelayJobData(details);
+    const jobId = extractJobIdFromApiUrl(details.url);
+    fetchAndRelayJobData(details, jobId);
   },
-  // Filter for the specific API endpoint.
-  { urls: ["*://*.linkedin.com/voyager/api/jobs/jobPostings/*"] },
+  { urls: ['*://*.linkedin.com/voyager/api/jobs/jobPostings/*'] }
 );
 
 /**
- * Fetches job data from the given URL and sends it to the content script.
- * @param {object} details The details object from the webRequest listener.
+ * Fetches job data from the given URL (retrying once on a transient failure)
+ * and sends it to the content script.
+ * @param {object} details The details object from the webRequest listener (or
+ *   a synthetic equivalent for a proactive fetch).
+ * @param {string|null} jobId The job id, when already known, used to dedupe
+ *   in-flight fetches and to key the cache.
  */
-async function fetchAndRelayJobData(details) {
-  // First, ensure the content script is injected and ready.
-  // This is the most robust way to prevent "Receiving end does not exist" errors.
-  // The content script itself ensures it only runs its setup logic once.
-  await injectScripts(details.tabId);
-
-  const { url, tabId, requestId } = details;
-  console.log(`[DEBUG] fetchAndRelayJobData called for tab ${tabId}`);
-
-  // Retrieve the stored headers using the unique requestId.
-  let headers = requestHeadersStore[requestId];
-
-  // For proactive fetches (manual-...), the requestId won't be in the store.
-  // In that case, we fall back to the last known good headers we captured.
-  if (!headers && requestId.startsWith('manual-')) {
-    console.log("[DEBUG] Using last known headers for proactive fetch.");
-    headers = lastKnownHeaders;
+async function fetchAndRelayJobData(details, jobId) {
+  if (jobId) {
+    if (pendingJobFetches.has(jobId)) {
+      log(`[DEBUG] Fetch for job ${jobId} already in flight, skipping duplicate.`);
+      return;
+    }
+    pendingJobFetches.add(jobId);
   }
-
-  if (!headers || Object.keys(headers).length === 0) {
-    console.error(`[DEBUG] CRITICAL: Could not find any headers for requestId ${requestId}. The request will fail.`);
-    return; // We cannot proceed without headers.
-  }
-  console.log("[DEBUG] Retrieved headers for fetch:", headers);
 
   try {
-    // Add a custom header to our fetch request to prevent an infinite loop.
+    // Ensure the content script is injected and ready before we try to
+    // message it -- this now actually awaits completion (see injectScripts).
+    await injectScripts(details.tabId);
+
+    const { url, tabId, requestId } = details;
+
+    let headers = requestHeadersStore[requestId];
+    // For proactive fetches (manual-...), the requestId won't be in the
+    // per-request store. Fall back to the last known good headers.
+    if (!headers && requestId.startsWith('manual-')) {
+      headers = await getLastKnownHeaders();
+    }
+
+    if (!headers || Object.keys(headers).length === 0) {
+      console.error(`[LinkedIn Exact Metrics] No captured auth headers for request ${requestId}; cannot fetch.`);
+      return;
+    }
+
     const fetchHeaders = { ...headers, 'X-Exact-Metrics-Request': 'true' };
+    const data = await fetchWithRetry(url, fetchHeaders);
+    if (!data) return;
 
-    console.log("[DEBUG] Making fetch request to:", url);
-    const response = await fetch(url, { headers: fetchHeaders, credentials: 'include' });
-    
-    if (!response.ok) {
-      throw new Error(`HTTP error! status: ${response.status}`);
-    }
-    const data = await response.json();
-    console.log("[DEBUG] Fetch successful. Response data:", data);
+    const parsed = parseJobPostingResponse(data);
+    log('[DEBUG] Extracted Metrics:', parsed);
 
-    // The API can return data in multiple formats. We'll check for all known structures.
-    // The user found `data.applies` and `data.views`. We'll prioritize that.
-    const applicantCount = data?.applies ?? data?.data?.applies ?? data?.jobPosting?.numApplicants ?? 'N/A';
-    const viewCount = data?.views ?? data?.data?.views ?? data?.jobPosting?.numViews ?? 'N/A';
-    const listedAt = data?.listedAt ?? data?.originalListedAt ?? null;
-
-    let jobAge = 'N/A';
-    if (listedAt) {
-      const postDate = new Date(listedAt);
-      const diffTime = new Date() - postDate; // Difference in milliseconds
-      const diffHours = Math.floor(diffTime / (1000 * 60 * 60));
-
-      if (diffHours < 1) {
-        jobAge = "Just now";
-      } else if (diffHours < 24) {
-        jobAge = diffHours === 1 ? `${diffHours} hour ago` : `${diffHours} hours ago`;
-      } else {
-        const diffDays = Math.floor(diffHours / 24);
-        jobAge = diffDays === 1 ? `${diffDays} day ago` : `${diffDays} days ago`;
+    if (parsed.hasData) {
+      const dataToSend = { viewCount: parsed.viewCount, applicantCount: parsed.applicantCount, jobAge: parsed.jobAge };
+      const resolvedJobId = jobId || extractJobIdFromApiUrl(url);
+      if (resolvedJobId) {
+        await cacheJobData(resolvedJobId, dataToSend);
       }
-    }
-
-    console.log(`[DEBUG] Extracted Metrics: Applicants - ${applicantCount}, Views - ${viewCount}, Age - ${jobAge}`);
-
-    // Only send a message if we have valid data to show.
-    if (applicantCount !== 'N/A' || viewCount !== 'N/A') {
-      const dataToSend = { viewCount, applicantCount, jobAge };
-
-      // Store the newly fetched data in session storage using the job ID as the key.
-      const url = new URL(details.url);
-      const jobId = url.pathname.split('/')[4];
-      if (jobId) {
-        console.log(`[DEBUG] Caching data for job ${jobId}.`);
-        await chrome.storage.session.set({ [jobId]: dataToSend });
-      }
-
-      // Send the processed data to the content script in the target tab.
-      console.log("[DEBUG] Sending metrics to content script.");
-      await chrome.tabs.sendMessage(tabId, { type: "UPDATE_METRICS", data: dataToSend });
+      await sendMessageSafe(tabId, { type: 'UPDATE_METRICS', data: dataToSend });
     }
   } catch (error) {
-    console.error("Background script fetch error:", error);
-    // Send an error message to the content script. The injectScripts call at the
-    // top of this function ensures the content script is ready to receive this.
-    chrome.tabs.sendMessage(tabId, {
-      type: "UPDATE_METRICS",
-      data: { viewCount: 'Error', applicantCount: `Fetch failed`, jobAge: 'N/A' }
-    }).catch(e => console.error("Failed to send error message to content script:", e));
+    console.error('[LinkedIn Exact Metrics] fetch error:', error);
+    sendMessageSafe(details.tabId, {
+      type: 'UPDATE_METRICS',
+      data: { viewCount: 'Error', applicantCount: 'Fetch failed', jobAge: 'N/A' },
+    });
   } finally {
-    // Clean up the stored headers for this request after it's done.
-    delete requestHeadersStore[requestId];
+    delete requestHeadersStore[details.requestId];
+    if (jobId) pendingJobFetches.delete(jobId);
+  }
+}
+
+/**
+ * Fetches a URL, retrying once after a short delay on a transient
+ * (429/5xx/network) failure. Returns the parsed JSON body, or throws if the
+ * request ultimately failed.
+ */
+async function fetchWithRetry(url, headers, attempt = 1) {
+  try {
+    const response = await fetch(url, { headers, credentials: 'include' });
+    if (!response.ok) {
+      const isTransient = response.status === 429 || response.status >= 500;
+      if (isTransient && attempt === 1) {
+        await new Promise((resolve) => setTimeout(resolve, 800));
+        return fetchWithRetry(url, headers, attempt + 1);
+      }
+      throw new Error(`HTTP error! status: ${response.status}`);
+    }
+    return await response.json();
+  } catch (error) {
+    if (attempt === 1) {
+      await new Promise((resolve) => setTimeout(resolve, 800));
+      return fetchWithRetry(url, headers, attempt + 1);
+    }
+    throw error;
   }
 }

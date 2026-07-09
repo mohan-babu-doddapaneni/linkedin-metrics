@@ -1,0 +1,29 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>LinkedIn Exact Metrics</title>
+  <link rel="stylesheet" href="popup.css" />
+</head>
+<body>
+  <header>
+    <h1>LinkedIn Exact Metrics</h1>
+    <p class="version" id="version"></p>
+  </header>
+
+  <label class="row">
+    <span>Show metrics widget on job pages</span>
+    <input type="checkbox" id="widgetEnabled" />
+  </label>
+
+  <label class="row">
+    <span>Enable debug logging</span>
+    <input type="checkbox" id="debugMode" />
+  </label>
+  <p class="hint">Leave this off unless you're troubleshooting -- it prints request/response details to the background service worker's console.</p>
+
+  <p class="status" id="status"></p>
+
+  <script src="popup.js"></script>
+</body>
+</html>
