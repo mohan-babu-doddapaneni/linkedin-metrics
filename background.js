@@ -1,7 +1,28 @@
 // background.js
 
 importScripts('lib/jobData.js');
-const { extractJobIdFromApiUrl, extractJobIdFromPageUrl, parseJobPostingResponse } = self.JobDataLib;
+const {
+  extractJobIdFromApiUrl,
+  extractJobIdFromJobPostingUrn,
+  extractJobIdFromPageUrl,
+  isJobPostingGraphqlUrl,
+  buildProactiveUrlFromTemplate,
+  parseJobPostingResponse,
+} = self.JobDataLib;
+
+/**
+ * Job id for a request we recognize as job-posting data, whichever URL shape
+ * it turns out to be (classic REST path or a GraphQL call referencing a
+ * jobPostingUrn). Returns null for anything else (including LinkedIn's many
+ * unrelated GraphQL calls on the same shared endpoint).
+ */
+function extractJobIdFromRelevantRequestUrl(urlString) {
+  return extractJobIdFromApiUrl(urlString) || extractJobIdFromJobPostingUrn(urlString);
+}
+
+function isRelevantJobRequestUrl(urlString) {
+  return extractJobIdFromApiUrl(urlString) !== null || isJobPostingGraphqlUrl(urlString);
+}
 
 // --- Settings (read from storage so the popup can change them at runtime) ---
 
@@ -65,6 +86,33 @@ async function getLastKnownHeaders() {
 
 async function setLastKnownHeaders(headers) {
   await chrome.storage.session.set({ [HEADERS_STORAGE_KEY]: headers });
+}
+
+// --- Learned request template -----------------------------------------------
+// LinkedIn's job-detail endpoint has moved around (classic REST vs. GraphQL)
+// and the exact shape isn't publicly documented or stable, so rather than
+// hardcode one guess, we remember the most recent real request LinkedIn's own
+// page made for a job posting and reuse its exact shape (with the job id
+// swapped in) for proactive fetches. This self-adapts to whichever endpoint
+// shape is actually in use for a given account/rollout instead of going stale
+// the next time LinkedIn changes it.
+const REQUEST_TEMPLATE_KEY = 'lastObservedJobRequest';
+
+async function rememberRequestTemplate(url, jobId) {
+  if (!jobId) return;
+  await chrome.storage.session.set({ [REQUEST_TEMPLATE_KEY]: { url, jobId } });
+}
+
+async function buildProactiveUrl(newJobId) {
+  const result = await chrome.storage.session.get(REQUEST_TEMPLATE_KEY);
+  const template = result[REQUEST_TEMPLATE_KEY];
+  const fromTemplate = template && buildProactiveUrlFromTemplate(template.url, template.jobId, newJobId);
+  if (fromTemplate) {
+    return fromTemplate;
+  }
+  // No request observed yet this session (e.g. the very first job viewed) --
+  // fall back to the historically-known classic REST shape as a best effort.
+  return `https://www.linkedin.com/voyager/api/jobs/jobPostings/${newJobId}?decorationId=com.linkedin.voyager.deco.jobs.web.shared.WebFullJobPosting-65`;
 }
 
 // --- Job data cache, capped so a long session doesn't grow storage forever --
@@ -157,9 +205,15 @@ chrome.webNavigation.onHistoryStateUpdated.addListener(async (details) => {
   }
 
   log(`[DEBUG] No cache for job ${jobId}. Proactively fetching.`);
-  const apiUrl = `https://www.linkedin.com/voyager/api/jobs/jobPostings/${jobId}?decorationId=com.linkedin.voyager.deco.jobs.web.shared.WebFullJobPosting-65`;
+  const apiUrl = await buildProactiveUrl(jobId);
   fetchAndRelayJobData({ url: apiUrl, tabId: details.tabId, requestId: `manual-${jobId}-${Date.now()}` }, jobId);
 });
+
+// Watched broadly (classic REST path + LinkedIn's shared GraphQL endpoint)
+// since the exact endpoint LinkedIn uses for job posting detail data isn't
+// stable or documented; isRelevantJobRequestUrl() filters out the many
+// unrelated GraphQL calls LinkedIn's SPA makes on the same shared endpoint.
+const WATCHED_URL_PATTERNS = ['*://*.linkedin.com/voyager/api/jobs/jobPostings/*', '*://*.linkedin.com/voyager/api/graphql*'];
 
 // Listen for the request headers of the API call to capture the csrf-token.
 chrome.webRequest.onBeforeSendHeaders.addListener(
@@ -167,6 +221,9 @@ chrome.webRequest.onBeforeSendHeaders.addListener(
     // If the request is from our own extension, ignore it to prevent loops.
     if (details.requestHeaders.some((h) => h.name.toLowerCase() === 'x-exact-metrics-request')) {
       return {};
+    }
+    if (!isRelevantJobRequestUrl(details.url)) {
+      return;
     }
 
     const { tabId, requestHeaders } = details;
@@ -182,9 +239,14 @@ chrome.webRequest.onBeforeSendHeaders.addListener(
       requestHeadersStore[details.requestId] = capturedHeaders;
       capPendingRequests();
       setLastKnownHeaders(capturedHeaders);
+
+      const observedJobId = extractJobIdFromRelevantRequestUrl(details.url);
+      if (observedJobId) {
+        rememberRequestTemplate(details.url, observedJobId);
+      }
     }
   },
-  { urls: ['*://*.linkedin.com/voyager/api/jobs/jobPostings/*'] },
+  { urls: WATCHED_URL_PATTERNS },
   ['requestHeaders']
 );
 
@@ -195,11 +257,12 @@ chrome.webRequest.onCompleted.addListener(
       return;
     }
     if (!widgetEnabled) return;
+    if (!isRelevantJobRequestUrl(details.url)) return;
 
-    const jobId = extractJobIdFromApiUrl(details.url);
+    const jobId = extractJobIdFromRelevantRequestUrl(details.url);
     fetchAndRelayJobData(details, jobId);
   },
-  { urls: ['*://*.linkedin.com/voyager/api/jobs/jobPostings/*'] }
+  { urls: WATCHED_URL_PATTERNS }
 );
 
 /**
@@ -247,7 +310,7 @@ async function fetchAndRelayJobData(details, jobId) {
 
     if (parsed.hasData) {
       const dataToSend = { viewCount: parsed.viewCount, applicantCount: parsed.applicantCount, jobAge: parsed.jobAge };
-      const resolvedJobId = jobId || extractJobIdFromApiUrl(url);
+      const resolvedJobId = jobId || extractJobIdFromRelevantRequestUrl(url);
       if (resolvedJobId) {
         await cacheJobData(resolvedJobId, dataToSend);
       }
